@@ -1,15 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import openai
+from typing import List, Literal
 import os
 import shutil
-from dotenv import load_dotenv
-from rag_utils import load_and_embed_file, get_relevant_chunks
-import json 
+import json
 
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+from utils.rag_utils import load_and_embed_file, get_relevant_chunks
+from openai import OpenAI
 
 app = FastAPI()
 
@@ -21,79 +19,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+UPLOAD_DIR = "temp_uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 class Message(BaseModel):
-    role: str
+    role: Literal["user", "assistant", "system"]
     content: str
 
-class Query(BaseModel):
-    messages: list[Message]
+class ChatRequest(BaseModel):
+    messages: List[Message]
 
-def delete_file(file_path: str):
-    if os.path.exists(file_path):
-        os.remove(file_path)
+
+def load_system_prompt():
+    with open("utils/chart_prompt.prompt", "r", encoding="utf-8") as f:
+        return f.read()
+
 
 @app.post("/upload")
-async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    file_location = f"backend/uploads/{file.filename}"
-    os.makedirs(os.path.dirname(file_location), exist_ok=True)
+async def upload_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    if background_tasks:
+        background_tasks.add_task(os.remove, file_path)
 
     try:
-        load_and_embed_file(file_location)
-    except ValueError as e:
-        return {"error": str(e)}
+        load_and_embed_file(file_path)
+        return {"message": "✅ File uploaded and processed successfully."}
+    except Exception as e:
+        return {"message": f"❌ Failed to process file: {str(e)}"}
 
-    # Flag if it's a tabular file (for special system prompt)
-    is_tabular = file.filename.endswith((".csv", ".xlsx"))
-    with open("backend/tabular_mode.txt", "w") as f:
-        f.write("true" if is_tabular else "false")
-
-    background_tasks.add_task(delete_file, file_location)
-
-    return {"message": f"{file.filename} uploaded and processed successfully."}
 
 @app.post("/ask")
-async def ask_question(query: Query):
-    messages = [m.dict() if isinstance(m, BaseModel) else m for m in query.messages]
+async def ask(request: ChatRequest):
+    client = OpenAI()
+    system_prompt = load_system_prompt()
 
-    latest_question = next((m["content"] for m in reversed(messages) if m["role"] == "user"), None)
+    messages = [{"role": "system", "content": system_prompt}] + [m.model_dump() for m in request.messages]
 
-    if latest_question:
-        rag_context = get_relevant_chunks(latest_question)
-
-        # Check if a tabular file was uploaded recently
-        try:
-            with open("backend/tabular_mode.txt", "r") as f:
-                tabular_mode = f.read().strip().lower() == "true"
-        except FileNotFoundError:
-            tabular_mode = False
-
-        system_prompt = (
-    "You are a data analysis assistant. When asked to analyze tabular data, respond with clear summaries. "
-   "If a chart would help, add a chart block like this:\n\n"
-"chart: {\n"
-"  \"type\": \"line\",  // or bar, pie, doughnut, radar\n"
-"  \"labels\": [...],\n"
-"  \"datasets\": [...][{\"label\": \"...\", \"data\": [...], \"backgroundColor\": \"...\"]\n"
-    "}\n"
-    "Only include the chart: block if it's directly relevant to the user's question."
-    if tabular_mode
-    else "You are a helpful research assistant."
-)
-
-
-        insert_index = 1 if messages[0]["role"] == "system" else 0
-        messages.insert(insert_index, {
-            "role": "system",
-            "content": f"{system_prompt}\n\nUse the following context:\n\n{rag_context}"
+    user_query = request.messages[-1].content
+    context = get_relevant_chunks(user_query)
+    if context and "⚠️" not in context:
+        messages.insert(1, {
+            "role": "user",
+            "content": f"Relevant document info:\n{context}"
         })
 
-    response = openai.chat.completions.create(
+    # Debug log (optional)
+    print("\n==== Prompt sent to GPT ====")
+    print(json.dumps(messages, indent=2))
+
+    response = client.chat.completions.create(
         model="gpt-4o",
-        messages=messages
+        messages=messages,
+        temperature=0.3
     )
 
-    
     return {"answer": response.choices[0].message.content}
